@@ -1,115 +1,177 @@
-import requests
+import time
+from selenium import webdriver
+from selenium.webdriver.firefox.options import Options
 from bs4 import BeautifulSoup
-import re
-import cyrtranslit
+from threading import Thread
 from multiprocessing import cpu_count
-from multiprocessing.pool import ThreadPool
-from json import dumps
+from tqdm import tqdm
+import json
+
+# Основная ссылка на Google Play
+HOST = 'https://play.google.com'
 
 
-class GooglePlayParser(object):
-    BASE_URL = 'https://play.google.com'
-    FETCH_NEXT = '_/PlayStoreUi/data/batchexecute?rpcids=qnKhOb&bl=boq_playuiserver_20210428.04_p0&authuser=0&soc-app=121&soc-platform=1&soc-device=1'
-    REQ_BODY = 'f.req=%5B%5B%5B%22qnKhOb%22%2C%22%5B%5Bnull%2C%5B%5B10%2C%5B10%2C50%5D%5D%2Ctrue%2Cnull%2C%5B96%2C27%2C4%2C8%2C57%2C30%2C110%2C79%2C11%2C16%2C49%2C1%2C3%2C9%2C12%2C104%2C55%2C56%2C51%2C10%2C34%2C77%5D%5D%2Cnull%2C%5C%22{token}%5C%22%5D%5D%22%2Cnull%2C%22generic%22%5D%5D%5D'
+def get_full_html(url, params=None):
+    """
+    Получает html страницу после загрузки всех элементов
+    Параметры
+    ---------
+    url : str
+        Ссылка на страницу
+    params : None
+    Возвращает
+    ----------
+    str
+        html код исходной страницы
+    """
+    # указываем дополнительные опции
+    options = Options()
+    options.add_argument('--ignore-certificate-errors')
+    options.add_argument('--incognito')
+    # безголовая версия браузера
+    options.add_argument('--headless')
+    driver = webdriver.Firefox(executable_path='driver/geckodriver', options=options)
+    # получаем текущую страницу
+    driver.get(url)
+    # обработка бесконечной прокрутки
+    while True:
+        # получаем текущую высоту страницы
+        cur_height = driver.execute_script("return document.body.scrollHeight")
+        # прокрутка вниз страницы
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+        # ждем загрузку остальных элементов
+        time.sleep(1)
+        # высота страницы после загрузки элементов
+        height_after_load = driver.execute_script("return document.body.scrollHeight")
+        # Если всевозможные элементы уже загрузились, то выходим из цикла
+        if cur_height == height_after_load:
+            break
+    html = driver.page_source
+    driver.quit()
+    return html
 
+
+def get_primary_info(html):
+    """
+    Получает предварительную информацию о приложениях
+    Параметры
+    ---------
+    html : str
+        Полная html страница с результатом поиска
+    Возвращает
+    ----------
+    dict[int: dict[str: str]]
+        Словарь первичной информации о приложениях
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    # находим все карточки с приложениями
+    items = soup.find_all('div', class_='vU6FJ p63iDd')
     apps = {}
 
-    def __init__(self, keyword):
-        self.keyword = keyword
-        self.kwdict = {'ru': cyrtranslit.to_cyrillic(keyword, 'ru'),
-                       'en': cyrtranslit.to_latin(keyword, 'ru')}
-        self.app_links = {}
-        self.app_list = []
+    for i, item in enumerate(items, 1):
+        # рейтинг может быть неопределен
+        average_rating = item.find('div', class_='pf5lIe')
+        if average_rating is not None:
+            average_rating = average_rating.find_next('div').get('aria-label').split()[1]
+        apps[i] = {
+            'name': item.find('div', class_='WsMG1c nnK0zc').get_text(strip=True),
+            'author': item.find('div',  class_='KoLSrc').get_text(strip=True),
+            'average_rating': average_rating,
+            'link': HOST + item.find('div', class_='b8cIId ReQCgd Q9MA7b').find_next('a').get('href'),
+        }
+    return apps
 
-    def fetch_first_chunk(self):
-        response = requests.get(
-            f'https://play.google.com/store/search?q={self.keyword}&c=apps')
-        html = BeautifulSoup(response.text, 'lxml')
-        app_links = set([self.BASE_URL + obj['href'] for obj in
-                         html.select('c-wiz > div > div > div > div > div > a')
-                         if obj['href'].startswith('/store/apps/details')])
-        token = [obj for obj in html.select(
-            'div > div > c-wiz > div > div > div > c-wiz > c-wiz > c-wiz > c-data')][
-            0]['jsdata'].split(';')[3]
-        self.app_links[token] = app_links
-        return token
 
-    def fetch_next_chunk(self, token):
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'}
-        response = requests.post(self.BASE_URL + '/' + self.FETCH_NEXT,
-                                 data=self.REQ_BODY.format(token=token),
-                                 headers=headers)
-        apps = re.findall(r'/store/apps/details\?[\\.A-Za-z0-9]*',
-                          response.text)
-        while token in self.app_links:
-            token += '1'
-        self.app_links[token] = set(
-            [self.BASE_URL + app.replace('\\\\u003d', '=').replace('\\', '') for
-             app in apps])
-        token = re.search(
-            r'null,\[null,\\"([A-Za-z0-9-]*)((?!store|google).)*generic',
-            response.text)
-        if token:
-            return token.group(1)
-        else:
-            return None
+def get_full_info(apps, id, keyword):
+    """
+    Получает полную информацию о приложении и дополняет к первичной
+    Параметры
+    ---------
+    apps : dict[int: dict[str: str]]
+        Словарь первичной информации о приложениях
+    id : int
+        Id приложения, для которого необходимо дополнить информацию
+    keyword : str
+        Ключевое слово, по которому производился поиск
+    Возвращает
+    ----------
+    None
+    """
+    # получаем ссылку на страницу приолжения
+    link = apps[id]['link']
+    # указываем дополнительные опции
+    options = Options()
+    options.add_argument('--ignore-certificate-errors')
+    options.add_argument('--incognito')
+    # безголовая версия браузера
+    options.add_argument('--headless')
+    driver = webdriver.Firefox(executable_path='driver/geckodriver', options=options)
+    # получаем текущую страницу
+    driver.get(link)
+    # получаем html код страницы
+    html = driver.page_source
+    # больле драйвер не нужен
+    driver.quit()
+    soup = BeautifulSoup(html, 'html.parser')
+    # выделяем карточку с приложением
+    app = soup.find('main', class_='LXrl4c')
+    # получаем описание
+    apps[id]['description'] = app.find('div', class_='DWPxHb').find_next('div').get_text()
+    # смотрим, есть ли ключевое слово в описании или названии приложения
+    if apps[id]['description'].lower().find(keyword) == -1 \
+            and apps[id]['name'].lower().find(keyword) == -1:
+        apps.pop(id)
+        return
+    # получаем категорию приложения
+    apps[id]['category'] = app.find('a', class_='hrTbp R8zArc').get_text()
+    # получаем количество оценок приложения
+    apps[id]['number_of_ratings'] = app.find('span', class_='AYi5wd TBRnV').find_next('span').get_text()
+    # получаем дату последнего обновления приложения
+    apps[id]['last_update'] = app.find('span', class_='htlgb').get_text()
 
-    def get_app_links(self):
-        self.app_list = []
-        self.app_links = {}
-        token = self.fetch_first_chunk()
-        while token is not None:
-            token = self.fetch_next_chunk(token)
-        for token in self.app_links:
-            self.app_list += list(self.app_links[token])
 
-    def safe_select(self, html, selector, id):
-        res = html.select(selector)
-        if len(res) <= id:
-            return None
-        else:
-            return res[id].text
-
-    def parse_app_helper(self, url):
-        response = requests.get(url)
-        if response.status_code == 200:
-            content = response.text
-            html = BeautifulSoup(content, 'lxml')
-            id = url[url.find('=') + 1:]
-            name = self.safe_select(html, 'h1.AHFaub > span', 0)
-            description = self.safe_select(html, 'div.DWPxHb > span > div', 0)
-            name_re = re.search(f'{self.kwdict["ru"]}|{self.kwdict["en"]}',
-                                name, re.IGNORECASE)
-            desc_re = re.search(f'{self.kwdict["ru"]}|{self.kwdict["en"]}',
-                                description, re.IGNORECASE)
-            if name_re is None and desc_re is None:
-                return
-            developer = self.safe_select(html, 'span.T32cc.UAO9ie > a', 0)
-            category = self.safe_select(html, 'a.hrTbp.R8zArc', 0)
-            rating = self.safe_select(html, 'div.BHMmbe', 0)
-            reviews_count = self.safe_select(html, 'span.EymY4b > span', 1)
-            last_update = self.safe_select(html, 'span.htlgb', 0)
-            self.apps[id] = {'name': name,
-                             'url': url,
-                             'developer': developer,
-                             'category': category,
-                             'description': description,
-                             'rating': rating,
-                             'reviews_count': reviews_count,
-                             'last_update': last_update}
-
-    def parse_apps(self):
-        self.get_app_links()
-        pool = ThreadPool(processes=cpu_count() * 10)
-        pool.map(self.parse_app_helper, self.app_list)
-        pool.close()
-        pool.join()
-        return dumps(self.apps, indent=4)
+def parse(url, keyword):
+    """
+    Парсит все приложения по указанному url
+    и проверяет наличие ключевого слова
+    Параметры
+    ---------
+    url : str
+        Ссылка на Google Play с запросом
+    keyword : str
+        Ключевое слово, по которому производился поиск
+    Возвращает
+    ----------
+    dict[int: dict[str: str]]
+        Словарь с полной информацией о приложениях
+    """
+    # получаем полную страницу html со всеми приложениями
+    html = get_full_html(url)
+    # получаем первичную информацию о приложениях
+    apps = get_primary_info(html)
+    # создаем список потоков
+    threads = [Thread(target=get_full_info, args=(apps, id, keyword)) for id in apps.keys()]
+    # определяем количесво итераций
+    iteration_count = cpu_count()-1
+    # количество обрабатываемых потоков
+    count_per_iteration = len(threads) / float(iteration_count)
+    for iter_num in tqdm(range(0, iteration_count),
+                         desc=f'Processing pages with {int(count_per_iteration)} threads'):
+        # определяем индексы
+        start = int(count_per_iteration * iter_num)
+        end = int(count_per_iteration * (iter_num + 1))
+        # запускаем потоки
+        for t in threads[start:end]:
+            t.daemon = True
+            t.start()
+            t.join()
+    return apps
 
 
 if __name__ == '__main__':
-    keyword = input('Keyword: ')
-    parser = GooglePlayParser(keyword)
-    json_data = parser.parse_apps()
-    print(json_data)
+    keyword = input('Еnter the keyword: (for example, "сбербанк")\n').lower()
+    url = HOST + f'/store/search?q={keyword}&c=apps'
+    apps = parse(url, keyword)
+    # сохраняем результат в формате json в папке data
+    with open(f'data/{keyword}.json', 'w') as file:
+        json.dump(apps, file)
